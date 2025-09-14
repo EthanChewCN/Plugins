@@ -1,10 +1,10 @@
-import { Plugin } from "@utils/pluginBase";
+import { Plugin } from "../src/utils/pluginBase";
 import { Api } from "telegram";
 import * as fs from "fs";
 import * as path from "path";
 import * as https from "https";
 import * as http from "http";
-import Database from "better-sqlite3";
+const Database = require("better-sqlite3");
 
 const CONFIG_KEYS = {
   AI_API_KEY: "ai_api_key",
@@ -31,16 +31,17 @@ const CONFIG_KEYS = {
   AI_BASE_URLS: "ai_base_urls", // { thirdparty?: string, openai?: string, ... }
   AI_MODELS: "ai_models", // { chat?: string, search?: string, image?: string, tts?: string }
   AI_THIRD_PARTY_COMPAT: "ai_thirdparty_compat", // openai|gemini|claude|deepseek|grok
-  AI_ACTIVE_PROVIDER: "ai_active_provider" // gemini|openai|claude|deepseek|grok|thirdparty
+  AI_ACTIVE_PROVIDER: "ai_active_provider", // gemini|openai|claude|deepseek|grok|thirdparty
+  AI_CURRENT_PROVIDER: "ai_current_provider" // 当前使用的服务商
 };
 
 const DEFAULT_CONFIG = {
-  [CONFIG_KEYS.AI_BASE_URL]: "https://generativelanguage.googleapis.com",
-  [CONFIG_KEYS.AI_CHAT_MODEL]: "gemini-2.0-flash",
-  [CONFIG_KEYS.AI_SEARCH_MODEL]: "gemini-2.0-flash",
-  [CONFIG_KEYS.AI_IMAGE_MODEL]: "gemini-2.0-flash-preview-image-generation",
-  [CONFIG_KEYS.AI_TTS_MODEL]: "gemini-2.5-flash-preview-tts",
-  [CONFIG_KEYS.AI_TTS_VOICE]: "Kore",
+  [CONFIG_KEYS.AI_BASE_URL]: "",
+  [CONFIG_KEYS.AI_CHAT_MODEL]: "",
+  [CONFIG_KEYS.AI_SEARCH_MODEL]: "",
+  [CONFIG_KEYS.AI_IMAGE_MODEL]: "",
+  [CONFIG_KEYS.AI_TTS_MODEL]: "",
+  [CONFIG_KEYS.AI_TTS_VOICE]: "",
   [CONFIG_KEYS.AI_MAX_TOKENS]: "0",
   [CONFIG_KEYS.AI_PROMPTS]: "{}",
   [CONFIG_KEYS.AI_CONTEXT_ENABLED]: "off",
@@ -63,22 +64,8 @@ if (!fs.existsSync(path.dirname(CONFIG_DB_PATH))) {
 }
 
 class ConfigManager {
-  private static db: Database.Database;
+  private static db: any;
   private static initialized = false;
-  // 配置缓存
-  private static cache = new Map<string, { value: string; timestamp: number }>();
-  private static allConfigCache: { data: { [key: string]: string }; timestamp: number } | null = null;
-  // 缓存过期时间（毫秒）
-  private static readonly CACHE_TTL = 5 * 60 * 1000; // 5分钟
-  // 缓存大小限制
-  private static readonly MAX_CACHE_SIZE = 1000;
-  // 批量操作缓存
-  private static pendingWrites = new Map<string, string>();
-  private static writeTimer: NodeJS.Timeout | null = null;
-  private static readonly BATCH_WRITE_DELAY = 1000; // 1秒
-  // 定期清理定时器
-  private static cleanupTimer: NodeJS.Timeout | null = null;
-  private static readonly CLEANUP_INTERVAL = 10 * 60 * 1000; // 10分钟
 
   private static init(): void {
     if (this.initialized) return;
@@ -97,175 +84,43 @@ class ConfigManager {
     }
   }
 
-  private static isCacheValid(timestamp: number): boolean {
-    return Date.now() - timestamp < this.CACHE_TTL;
-  }
-
-  private static invalidateCache(key?: string): void {
-    if (key) {
-      this.cache.delete(key);
-    } else {
-      this.cache.clear();
-    }
-    this.allConfigCache = null;
-  }
-
-  /**
-   * 清理过期缓存项
-   */
-  private static cleanupExpiredCache(): void {
-    const now = Date.now();
-    const expiredKeys: string[] = [];
-    
-    for (const [key, { timestamp }] of this.cache) {
-      if (now - timestamp >= this.CACHE_TTL) {
-        expiredKeys.push(key);
+  static get(key: string, defaultValue?: string): string {
+    this.init();
+    try {
+      const stmt = this.db.prepare("SELECT value FROM config WHERE key = ?");
+      const row = stmt.get(key) as { value: string } | undefined;
+      if (row) {
+        return row.value;
       }
+    } catch (error) {
+      console.error("读取配置失败:", error);
     }
-    
-    expiredKeys.forEach(key => this.cache.delete(key));
-    
-    // 清理全量缓存如果过期
-    if (this.allConfigCache && now - this.allConfigCache.timestamp >= this.CACHE_TTL) {
-      this.allConfigCache = null;
-    }
-    
-    if (expiredKeys.length > 0) {
-      console.debug(`[ConfigManager] 清理了 ${expiredKeys.length} 个过期缓存项`);
-    }
+    return defaultValue || DEFAULT_CONFIG[key] || "";
   }
 
-  /**
-   * 限制缓存大小，移除最旧的项
-   */
-  private static limitCacheSize(): void {
-    if (this.cache.size <= this.MAX_CACHE_SIZE) return;
-    
-    const entries = Array.from(this.cache.entries())
-      .sort(([, a], [, b]) => a.timestamp - b.timestamp);
-    
-    const toRemove = entries.slice(0, this.cache.size - this.MAX_CACHE_SIZE);
-    toRemove.forEach(([key]) => this.cache.delete(key));
-    
-    console.debug(`[ConfigManager] 缓存大小限制，移除了 ${toRemove.length} 个最旧的缓存项`);
-  }
-
-  /**
-   * 启动定期清理任务
-   */
-  private static startCleanupTimer(): void {
-    if (this.cleanupTimer) return;
-    
-    this.cleanupTimer = setInterval(() => {
-      this.cleanupExpiredCache();
-      this.limitCacheSize();
-    }, this.CLEANUP_INTERVAL);
-  }
-
-  /**
-   * 停止定期清理任务
-   */
-  private static stopCleanupTimer(): void {
-    if (this.cleanupTimer) {
-      clearInterval(this.cleanupTimer);
-      this.cleanupTimer = null;
-    }
-  }
-
-  private static executeBatchWrites(): void {
-    if (this.pendingWrites.size === 0) return;
-    
+  static set(key: string, value: string): void {
     this.init();
     try {
       const stmt = this.db.prepare(`
         INSERT OR REPLACE INTO config (key, value, updated_at) 
         VALUES (?, ?, CURRENT_TIMESTAMP)
       `);
-      
-      const transaction = this.db.transaction(() => {
-        for (const [key, value] of this.pendingWrites) {
-          stmt.run(key, value);
-        }
-      });
-      
-      transaction();
-      this.pendingWrites.clear();
+      stmt.run(key, value);
     } catch (error) {
-      console.error("批量保存配置失败:", error);
+      console.error("保存配置失败:", error);
     }
-  }
-
-  static get(key: string, defaultValue?: string): string {
-    // 检查缓存
-    const cached = this.cache.get(key);
-    if (cached && this.isCacheValid(cached.timestamp)) {
-      return cached.value;
-    }
-
-    this.init();
-    this.startCleanupTimer(); // 启动清理任务
-    
-    try {
-      const stmt = this.db.prepare("SELECT value FROM config WHERE key = ?");
-      const row = stmt.get(key) as { value: string } | undefined;
-      
-      if (row) {
-        // 更新缓存
-        this.cache.set(key, { value: row.value, timestamp: Date.now() });
-        this.limitCacheSize(); // 检查缓存大小
-        return row.value;
-      }
-    } catch (error) {
-      console.error("读取配置失败:", error);
-    }
-    
-    const defaultVal = defaultValue || DEFAULT_CONFIG[key] || "";
-    // 缓存默认值
-    this.cache.set(key, { value: defaultVal, timestamp: Date.now() });
-    this.limitCacheSize(); // 检查缓存大小
-    return defaultVal;
-  }
-
-  static set(key: string, value: string): void {
-    // 立即更新缓存
-    this.cache.set(key, { value, timestamp: Date.now() });
-    this.invalidateCache(); // 清除全量缓存
-    
-    // 添加到批量写入队列
-    this.pendingWrites.set(key, value);
-    
-    // 设置批量写入定时器
-    if (this.writeTimer) {
-      clearTimeout(this.writeTimer);
-    }
-    
-    this.writeTimer = setTimeout(() => {
-      this.executeBatchWrites();
-      this.writeTimer = null;
-    }, this.BATCH_WRITE_DELAY);
   }
 
   static getAll(): { [key: string]: string } {
-    // 检查全量缓存
-    if (this.allConfigCache && this.isCacheValid(this.allConfigCache.timestamp)) {
-      return { ...this.allConfigCache.data };
-    }
-
     this.init();
     try {
       const stmt = this.db.prepare("SELECT key, value FROM config");
       const rows = stmt.all() as { key: string; value: string }[];
-      
       const config: { [key: string]: string } = {};
       rows.forEach(row => {
         config[row.key] = row.value;
-        // 同时更新单项缓存
-        this.cache.set(row.key, { value: row.value, timestamp: Date.now() });
       });
-      
-      // 更新全量缓存
-      this.allConfigCache = { data: config, timestamp: Date.now() };
-      return { ...config };
+      return config;
     } catch (error) {
       console.error("读取所有配置失败:", error);
       return {};
@@ -273,8 +128,6 @@ class ConfigManager {
   }
 
   static delete(key: string): void {
-    this.invalidateCache(key);
-    
     this.init();
     try {
       const stmt = this.db.prepare("DELETE FROM config WHERE key = ?");
@@ -285,86 +138,18 @@ class ConfigManager {
   }
 
   static close(): void {
-    // 停止定期清理任务
-    this.stopCleanupTimer();
-    
-    // 执行剩余的批量写入
-    if (this.writeTimer) {
-      clearTimeout(this.writeTimer);
-      this.executeBatchWrites();
-    }
-    
     if (this.db) {
       this.db.close();
     }
-    
-    // 清理缓存
-    this.cache.clear();
-    this.allConfigCache = null;
-    
-    console.debug('[ConfigManager] 资源已清理，数据库连接已关闭');
+    console.debug('[ConfigManager] 数据库连接已关闭');
   }
 
-  // 手动刷新缓存
   static flushCache(): void {
-    this.invalidateCache();
+    // 简化版本不需要缓存刷新
   }
 
-  // 立即执行待写入的配置
   static flush(): void {
-    if (this.writeTimer) {
-      clearTimeout(this.writeTimer);
-      this.writeTimer = null;
-    }
-    this.executeBatchWrites();
-  }
-
-  /**
-   * 获取缓存统计信息
-   */
-  static getCacheStats(): {
-    cacheSize: number;
-    maxCacheSize: number;
-    allConfigCached: boolean;
-    pendingWrites: number;
-    memoryUsageEstimate: string;
-  } {
-    // 估算内存使用（粗略计算）
-    let memoryBytes = 0;
-    for (const [key, { value }] of this.cache) {
-      memoryBytes += (key.length + value.length) * 2; // UTF-16 字符
-      memoryBytes += 16; // 时间戳和对象开销
-    }
-    
-    if (this.allConfigCache) {
-      const dataStr = JSON.stringify(this.allConfigCache.data);
-      memoryBytes += dataStr.length * 2 + 16;
-    }
-    
-    const memoryKB = Math.round(memoryBytes / 1024);
-    const memoryUsageEstimate = memoryKB > 1024 
-      ? `${Math.round(memoryKB / 1024 * 100) / 100} MB`
-      : `${memoryKB} KB`;
-    
-    return {
-      cacheSize: this.cache.size,
-      maxCacheSize: this.MAX_CACHE_SIZE,
-      allConfigCached: this.allConfigCache !== null,
-      pendingWrites: this.pendingWrites.size,
-      memoryUsageEstimate
-    };
-  }
-
-  /**
-   * 手动触发缓存清理
-   */
-  static performMaintenance(): void {
-    const beforeSize = this.cache.size;
-    this.cleanupExpiredCache();
-    this.limitCacheSize();
-    const afterSize = this.cache.size;
-    
-    console.info(`[ConfigManager] 缓存维护完成: ${beforeSize} -> ${afterSize} 项`);
+    // 简化版本不需要批量写入刷新
   }
 }
 
@@ -386,7 +171,6 @@ class Utils {
     return lines.join('\n');
   }
 
-  // 根据模型名推断提供商显示名
   static getProviderByModel(model?: string | null): string {
     const m = (model || '').toLowerCase();
     if (!m) return 'Google Gemini';
@@ -398,7 +182,6 @@ class Utils {
     return 'AI';
   }
 
-  // 渲染统一格式的页脚文案
   static renderPoweredByFooter(opts: { model?: string | null; withSearch?: boolean; kind?: 'chat'|'search'|'image'|'tts'|'audio'; voiceName?: string; errorText?: string } = {}): string {
     const provider = Utils.getProviderByModel(opts.model);
     const searchSuffix = opts.withSearch ? ' with Google Search' : '';
@@ -441,11 +224,10 @@ class Utils {
   }
 
   static removeEmoji(text: string): string {
-    // 简单的emoji移除方法
     return text
-      .replace(/[\u2600-\u27BF]/g, '') // 杂项符号
-      .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '') // 代理对（包含大部分emoji）
-      .replace(/[\uFE0F\u200D]/g, '') // 变体选择器和零宽连接符
+      .replace(/[\u2600-\u27BF]/g, '')
+      .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, '')
+      .replace(/[\uFE0F\u200D]/g, '')
       .trim();
   }
 
@@ -524,7 +306,6 @@ class Utils {
     const imageFile = Object.assign(imageData, {
       name: 'ai.png'
     });
-    
     await msg.client?.sendFile(msg.peerId, {
       file: imageFile,
       caption,
@@ -540,8 +321,8 @@ class Utils {
     mimeType?: string
   ): Promise<void> {
     let processedAudio = audioData;
-    if (mimeType && mimeType.includes('L16') && mimeType.includes('pcm')) {
-      processedAudio = this.convertToWav(audioData, mimeType);
+    if (Utils.isPcmL16Audio(mimeType)) {
+      processedAudio = this.convertToWav(audioData, mimeType!);
     }
     const audioFile = Object.assign(processedAudio, {
       name: 'ai.ogg'
@@ -598,31 +379,22 @@ class Utils {
     const byteRate = sampleRate * numChannels * bitsPerSample / 8;
     const blockAlign = numChannels * bitsPerSample / 8;
     const buffer = Buffer.alloc(44);
-
-    buffer.write('RIFF', 0);                      
-    buffer.writeUInt32LE(36 + dataLength, 4);     
-    buffer.write('WAVE', 8);                      
-    buffer.write('fmt ', 12);                     
-    buffer.writeUInt32LE(16, 16);                 
-    buffer.writeUInt16LE(1, 20);                  
-    buffer.writeUInt16LE(numChannels, 22);        
-    buffer.writeUInt32LE(sampleRate, 24);         
-    buffer.writeUInt32LE(byteRate, 28);           
-    buffer.writeUInt16LE(blockAlign, 32);         
-    buffer.writeUInt16LE(bitsPerSample, 34);      
-    buffer.write('data', 36);                     
-    buffer.writeUInt32LE(dataLength, 40);         
-
+    buffer.write('RIFF', 0);
+    buffer.writeUInt32LE(36 + dataLength, 4);
+    buffer.write('WAVE', 8);
+    buffer.write('fmt ', 12);
+    buffer.writeUInt32LE(16, 16);
+    buffer.writeUInt16LE(1, 20);
+    buffer.writeUInt16LE(numChannels, 22);
+    buffer.writeUInt32LE(sampleRate, 24);
+    buffer.writeUInt32LE(byteRate, 28);
+    buffer.writeUInt16LE(blockAlign, 32);
+    buffer.writeUInt16LE(bitsPerSample, 34);
+    buffer.write('data', 36);
+    buffer.writeUInt32LE(dataLength, 40);
     return buffer;
   }
 
-  /**
-   * 标准化错误处理工具
-   * @param error 错误对象
-   * @param context 错误上下文
-   * @param options 处理选项
-   * @returns 格式化的用户友好错误消息
-   */
   static handleError(error: any, context: string, options: {
     logLevel?: 'error' | 'warn' | 'info';
     includeStack?: boolean;
@@ -635,13 +407,10 @@ class Utils {
       customMessage,
       showTechnicalDetails = false
     } = options;
-
     const timestamp = new Date().toISOString();
     const errorMessage = error?.message || '未知错误';
     const errorStack = error?.stack || '';
     const errorCode = error?.code || error?.status || '';
-
-    // 记录详细错误信息到控制台
     const logMessage = `[${timestamp}] [${context}] 错误: ${errorMessage}`;
     if (logLevel === 'error') {
       console.error(logMessage);
@@ -755,6 +524,55 @@ class Utils {
     return originalMessage.length > 100 ? 
       originalMessage.substring(0, 100) + '...' : 
       originalMessage;
+  }
+
+  static sanitizeApiError(errorMsg: string): string {
+    return errorMsg.replace(/api_key:[A-Za-z0-9_-]+/g, 'api_key:***');
+  }
+
+  static validateApiResponse(response: any, context: string = 'API'): void {
+    if (response.status !== 200 || response.data?.error) {
+      const errorMsg = response.data?.error?.message || JSON.stringify(response.data);
+      const sanitizedMsg = Utils.sanitizeApiError(errorMsg);
+      throw new Error(`${context}错误 ${response.status}: ${sanitizedMsg}`);
+    }
+  }
+
+  static createThirdPartyApiError(status: number, data: any, debugInfo: string[]): Error {
+    const errorMsg = data?.error?.message || data?.message || JSON.stringify(data || {});
+    const sanitizedMsg = Utils.sanitizeApiError(errorMsg);
+    return new Error(`❌ 第三方API调用失败\n\n${debugInfo.join('\n')}\n错误详情: ${sanitizedMsg}`);
+  }
+
+  static validateApiKey(provider: string): string {
+    const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, "{}");
+    const apiKey = keys[provider];
+    if (!apiKey) throw new Error(`未设置 ${provider} API 密钥`);
+    return apiKey;
+  }
+
+  static getBaseUrls(): Record<string, string> {
+    return getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, "{}");
+  }
+
+  static readonly DEFAULT_PROVIDER_BASE_URLS: Record<string, string> = {
+    openai: 'https://api.openai.com',
+    claude: 'https://api.anthropic.com',
+    deepseek: 'https://api.deepseek.com',
+    grok: 'https://api.x.ai',
+    gemini: 'https://generativelanguage.googleapis.com'
+  };
+
+  static createApiHeaders(apiKey: string, additionalHeaders: Record<string, string> = {}): Record<string, string> {
+    return {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      ...additionalHeaders
+    };
+  }
+
+  static isPcmL16Audio(mimeType?: string): boolean {
+    return !!(mimeType && mimeType.includes('L16') && mimeType.includes('pcm'));
   }
 
   /**
@@ -1018,7 +836,7 @@ class AiClient {
 
   constructor(apiKey: string, baseUrl?: string | null) {
     this.apiKey = apiKey;
-    this.baseUrl = baseUrl ?? DEFAULT_CONFIG[CONFIG_KEYS.AI_BASE_URL];
+    this.baseUrl = baseUrl ?? Utils.DEFAULT_PROVIDER_BASE_URLS.gemini;
   }
 
   async generateContent(params: {
@@ -1104,12 +922,7 @@ class AiClient {
       data: requestData
     });
 
-    if (response.status !== 200 || response.data?.error) {
-      const errorMsg = response.data?.error?.message || JSON.stringify(response.data);
-      // 隐藏可能包含API密钥的敏感信息
-      const sanitizedMsg = errorMsg.replace(/api_key:[A-Za-z0-9_-]+/g, 'api_key:***');
-      throw new Error(`API Error: ${response.status} - ${sanitizedMsg}`);
-    }
+    Utils.validateApiResponse(response, 'API');
 
     const parts = response.data?.candidates?.[0]?.content?.parts || [];
     let text: string | undefined;
@@ -1171,19 +984,13 @@ class AiClient {
     });
 
     if (response.status !== 200) {
-      const errorMsg = response.data?.error?.message || 'Unknown error';
       if (response.status === 429) {
         throw new Error('API配额已用完，请检查您的计费详情');
       }
-      const sanitizedMsg = errorMsg.replace(/api_key:[A-Za-z0-9_-]+/g, 'api_key:***');
-      throw new Error(`HTTP错误 ${response.status}: ${sanitizedMsg}`);
+      Utils.validateApiResponse(response, 'TTS');
     }
 
-    if (response.data?.error) {
-      const errorMsg = response.data.error.message || JSON.stringify(response.data.error);
-      const sanitizedMsg = errorMsg.replace(/api_key:[A-Za-z0-9_-]+/g, 'api_key:***');
-      throw new Error(`API错误: ${sanitizedMsg}`);
-    }
+    Utils.validateApiResponse(response, 'API');
 
     const candidate = response.data?.candidates?.[0];
     
@@ -1215,11 +1022,7 @@ class AiClient {
       headers
     });
 
-    if (response.status !== 200 || response.data?.error) {
-      const errorMsg = response.data?.error?.message || JSON.stringify(response.data);
-      const sanitizedMsg = errorMsg.replace(/api_key:[A-Za-z0-9_-]+/g, 'api_key:***');
-      throw new Error(`API Error: ${response.status} - ${sanitizedMsg}`);
-    }
+    Utils.validateApiResponse(response, 'API');
 
     return (response.data?.models || []).map((model: any) => 
       model.name?.replace('models/', '') || model.name
@@ -1280,7 +1083,7 @@ function getProviderFromModel(modelName: string): 'gemini' | 'openai' | 'claude'
   if (model.includes('grok')) return 'grok';
   
   // 如果无法从模型名推断，检查是否是第三方设置的模型
-  const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, '{}');
+  const baseUrls = Utils.getBaseUrls();
   const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, '{}');
   
   // 如果配置了第三方服务商且模型不属于其他官方服务商，则认为是第三方
@@ -1294,7 +1097,7 @@ function getProviderFromModel(modelName: string): 'gemini' | 'openai' | 'claude'
 // 智能服务商选择 - 根据功能需求和质量评分选择最佳服务商
 function getActiveProviderFor(feature: 'chat' | 'search' | 'image' | 'tts'): 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok' | 'thirdparty' {
   const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, "{}");
-  const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, "{}");
+  const baseUrls = Utils.getBaseUrls();
   const compat = getThirdPartyCompat();
   
   // 首先检查用户是否通过ai select设置了活跃服务商
@@ -1340,7 +1143,11 @@ function getActiveProviderFor(feature: 'chat' | 'search' | 'image' | 'tts'): 'ge
   if (baseUrls?.thirdparty && (keys?.thirdparty || getConfig(CONFIG_KEYS.AI_API_KEY))) {
     const effectiveCompat = compat || 'openai';
     if (isFeatureSupported('thirdparty', feature)) {
-      const score = providerQualityScores['thirdparty']?.[feature] || 6;
+      // 如果有兼容模式设置，使用对应官方服务商的质量评分
+      let score = providerQualityScores['thirdparty']?.[feature] || 6;
+      if (compat && providerQualityScores[compat]) {
+        score = providerQualityScores[compat][feature] || score;
+      }
       availableProviders.push({ provider: 'thirdparty', score });
     }
   }
@@ -1604,13 +1411,53 @@ async function performAutoModelAssignment(baseUrl: string, forceUpdate: boolean 
     return '⚠️ 未设置第三方API密钥，无法自动匹配模型';
   }
   
-  const models = await fetchThirdPartyModels(baseUrl, apiKey, compatMode);
-  
-  if (models.length === 0) {
-    return '⚠️ 无法获取第三方API模型列表，请检查配置';
+  // 根据兼容模式使用相应的默认模型配置
+  let assignments: Record<string, string>;
+  if (compatMode === 'openai') {
+    assignments = {
+      chat: 'gpt-4o',
+      search: 'gpt-4o', 
+      image: 'dall-e-3',
+      tts: 'tts-1'
+    };
+  } else if (compatMode === 'gemini') {
+    assignments = {
+      chat: 'gemini-2.0-flash',
+      search: 'gemini-2.0-flash',
+      image: 'gemini-2.0-flash-preview-image-generation',
+      tts: 'gemini-2.5-flash-preview-tts'
+    };
+  } else if (compatMode === 'claude') {
+    assignments = {
+      chat: 'claude-3-5-sonnet-20241022',
+      search: 'claude-3-5-sonnet-20241022',
+      image: '', // Claude不支持图片生成
+      tts: '' // Claude不支持TTS
+    };
+  } else if (compatMode === 'deepseek') {
+    assignments = {
+      chat: 'deepseek-chat',
+      search: 'deepseek-chat',
+      image: '', // DeepSeek不支持图片生成
+      tts: '' // DeepSeek不支持TTS
+    };
+  } else if (compatMode === 'grok') {
+    assignments = {
+      chat: 'grok-beta',
+      search: 'grok-beta',
+      image: '', // Grok不支持图片生成
+      tts: '' // Grok不支持TTS
+    };
+  } else {
+    // 未知兼容模式，尝试获取实际模型列表
+    const models = await fetchThirdPartyModels(baseUrl, apiKey, compatMode);
+    
+    if (models.length === 0) {
+      return '⚠️ 无法获取第三方API模型列表，请检查配置';
+    }
+    
+    assignments = autoAssignThirdPartyModels(models);
   }
-  
-  const assignments = autoAssignThirdPartyModels(models);
   
   if (Object.keys(assignments).length === 0) {
     return '⚠️ 未找到可匹配的模型';
@@ -1632,8 +1479,16 @@ async function performAutoModelAssignment(baseUrl: string, forceUpdate: boolean 
       if (feature === 'tts') {
         const currentVoice = getConfig(CONFIG_KEYS.AI_TTS_VOICE);
         if (forceUpdate || !currentVoice || currentVoice === DEFAULT_CONFIG[CONFIG_KEYS.AI_TTS_VOICE]) {
-          // 使用基于provider的语音选择，而不是基于模型名称
-          const defaultVoice = getDefaultVoiceForCurrentTTS();
+          // 根据兼容模式设置对应的默认音色
+          let defaultVoice = 'alloy'; // 默认使用alloy
+          if (compatMode === 'openai') {
+            defaultVoice = 'alloy';
+          } else if (compatMode === 'gemini') {
+            defaultVoice = 'Kore';
+          } else {
+            // 其他兼容模式使用alloy
+            defaultVoice = 'alloy';
+          }
           ConfigManager.set(CONFIG_KEYS.AI_TTS_VOICE, defaultVoice);
         }
       }
@@ -1814,6 +1669,98 @@ async function performOfficialAutoModelAssignment(
   }
 }
 
+/**
+ * 统一的自动模型匹配函数，根据当前服务商匹配可用模型到各功能模块
+ * @param forceUpdate 是否强制更新已有配置
+ * @returns 配置结果消息
+ */
+async function performCurrentProviderAutoModelAssignment(forceUpdate: boolean = false): Promise<string> {
+  // 优先使用AI_ACTIVE_PROVIDER，如果没有则使用AI_CURRENT_PROVIDER
+  const activeProvider = getConfig(CONFIG_KEYS.AI_ACTIVE_PROVIDER);
+  const currentProvider = activeProvider || getConfig(CONFIG_KEYS.AI_CURRENT_PROVIDER);
+  
+  if (!currentProvider) {
+    return '⚠️ 未设置当前服务商，请先使用 ai select <服务商> 选择服务商';
+  }
+  
+  if (currentProvider === 'thirdparty') {
+    // 第三方服务商需要baseUrl
+    const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, '{}');
+    const baseUrl = baseUrls.thirdparty;
+    
+    if (!baseUrl) {
+      return '⚠️ 第三方服务商未设置baseUrl，请先使用 ai baseurl thirdparty <地址> 设置';
+    }
+    
+    // 检查是否有兼容模式设置（用于第三方API访问官方服务商）
+    const compatMode = getConfig(CONFIG_KEYS.AI_THIRD_PARTY_COMPAT);
+    if (compatMode && ['gemini', 'openai', 'claude', 'deepseek', 'grok'].includes(compatMode)) {
+      // 使用兼容模式的官方模型配置
+      return await performOfficialAutoModelAssignment(compatMode as 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok', forceUpdate);
+    } else {
+      // 普通第三方服务商
+      return await performAutoModelAssignment(baseUrl, forceUpdate);
+    }
+  } else {
+    // 官方服务商
+    const officialProvider = currentProvider as 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok';
+    return await performOfficialAutoModelAssignment(officialProvider, forceUpdate);
+  }
+}
+
+/**
+ * 检查当前服务商是否支持指定功能
+ * @param feature 功能名称
+ * @returns 是否支持该功能
+ */
+function isCurrentProviderSupportFeature(feature: 'chat' | 'search' | 'image' | 'tts'): boolean {
+  const currentProvider = getConfig(CONFIG_KEYS.AI_CURRENT_PROVIDER);
+  
+  if (!currentProvider) {
+    return false;
+  }
+  
+  if (currentProvider === 'thirdparty') {
+    // 检查是否有兼容模式设置（用于第三方API访问官方服务商）
+    const compatMode = getConfig(CONFIG_KEYS.AI_THIRD_PARTY_COMPAT);
+    if (compatMode && ['gemini', 'openai', 'claude', 'deepseek', 'grok'].includes(compatMode)) {
+      // 使用兼容模式的官方服务商功能支持
+      const officialProvider = compatMode as 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok';
+      const providerModels = OFFICIAL_API_MODELS[officialProvider];
+      return !!(providerModels && providerModels[feature]);
+    } else {
+      // 普通第三方服务商的功能支持取决于实际模型
+      const models = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_MODELS, '{}');
+      return !!(models[feature] && models[feature].trim());
+    }
+  } else {
+    // 官方服务商的功能支持
+    const officialProvider = currentProvider as 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok';
+    const providerModels = OFFICIAL_API_MODELS[officialProvider];
+    return !!(providerModels && providerModels[feature]);
+  }
+}
+
+/**
+ * 获取当前服务商支持的功能列表
+ * @returns 支持的功能列表和不支持的功能列表
+ */
+function getCurrentProviderSupportedFeatures(): { supported: string[], unsupported: string[] } {
+  const features = ['chat', 'search', 'image', 'tts'] as const;
+  const supported: string[] = [];
+  const unsupported: string[] = [];
+  
+  for (const feature of features) {
+    if (isCurrentProviderSupportFeature(feature)) {
+      supported.push(feature);
+    } else {
+      unsupported.push(feature);
+    }
+  }
+  
+  return { supported, unsupported };
+}
+
 function getActiveModelFor(feature: 'chat' | 'search' | 'image' | 'tts'): string {
   // 获取当前选择的提供商
   let provider: string;
@@ -1826,11 +1773,7 @@ function getActiveModelFor(feature: 'chat' | 'search' | 'image' | 'tts'): string
   const models = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_MODELS, "{}");
   if (models && models[feature]) {
     const configuredModel = models[feature];
-    // 如果选择的是Gemini提供商，但配置的模型不是Gemini兼容的，使用默认Gemini模型
-     if (provider === 'gemini' && configuredModel && !configuredModel.startsWith('gemini-')) {
-       const defaultKey = `ai_${feature}_model`;
-       return DEFAULT_CONFIG[defaultKey] || getConfig(defaultKey);
-     }
+    // 直接返回配置的模型，不再强制检查gemini兼容性
     return configuredModel;
   }
   
@@ -1844,13 +1787,13 @@ function getActiveModelFor(feature: 'chat' | 'search' | 'image' | 'tts'): string
     }
   })();
   
-  // 如果选择的是Gemini提供商，但旧配置的模型不是Gemini兼容的，使用默认Gemini模型
-   if (provider === 'gemini' && legacyModel && !legacyModel.startsWith('gemini-')) {
-     const defaultKey = `ai_${feature}_model`;
-     return DEFAULT_CONFIG[defaultKey] || legacyModel;
-   }
+  // 如果有旧配置，直接返回
+  if (legacyModel) {
+    return legacyModel;
+  }
   
-  return legacyModel;
+  // 如果没有任何配置，返回空字符串
+  return '';
 }
 
 // 适配层接口与能力矩阵
@@ -2702,19 +2645,12 @@ async function chatViaProviderOpenAI(provider: string, params: {
   systemInstruction?: string;
   maxOutputTokens?: number;
 }): Promise<{ text: string }> {
-  const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, "{}");
-  const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, "{}");
+  const baseUrls = Utils.getBaseUrls();
   
-  const apiKey = keys[provider];
-  if (!apiKey) throw new Error(`未设置 ${provider} API 密钥`);
+  const apiKey = Utils.validateApiKey(provider);
   
   // 获取各服务商的基础URL
-  const providerBaseUrls: Record<string, string> = {
-    openai: 'https://api.openai.com',
-    claude: 'https://api.anthropic.com',
-    deepseek: 'https://api.deepseek.com',
-    grok: 'https://api.x.ai'
-  };
+  const providerBaseUrls = Utils.DEFAULT_PROVIDER_BASE_URLS;
   
   const baseUrl = baseUrls[provider] || providerBaseUrls[provider] || '';
   const url = `${baseUrl.replace(/\/$/, '')}/v1/chat/completions`;
@@ -2774,19 +2710,12 @@ async function imageViaProvider(provider: string, params: {
   model: string;
   contents: any[];
 }) {
-  const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, "{}");
-  const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, "{}");
+  const baseUrls = Utils.getBaseUrls();
   
-  const apiKey = keys[provider];
-  if (!apiKey) throw new Error(`未设置 ${provider} API 密钥`);
+  const apiKey = Utils.validateApiKey(provider);
   
   // 获取各服务商的基础URL
-  const providerBaseUrls: Record<string, string> = {
-    openai: 'https://api.openai.com',
-    claude: 'https://api.anthropic.com',
-    deepseek: 'https://api.deepseek.com',
-    grok: 'https://api.x.ai'
-  };
+  const providerBaseUrls = Utils.DEFAULT_PROVIDER_BASE_URLS;
   
   const baseUrl = baseUrls[provider] || providerBaseUrls[provider] || '';
   
@@ -2833,19 +2762,12 @@ async function ttsViaProvider(provider: string, params: {
   text: string;
   voiceName?: string;
 }) {
-  const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, "{}");
-  const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, "{}");
+  const baseUrls = Utils.getBaseUrls();
   
-  const apiKey = keys[provider];
-  if (!apiKey) throw new Error(`未设置 ${provider} API 密钥`);
+  const apiKey = Utils.validateApiKey(provider);
   
   // 获取各服务商的基础URL
-  const providerBaseUrls: Record<string, string> = {
-    openai: 'https://api.openai.com',
-    claude: 'https://api.anthropic.com',
-    deepseek: 'https://api.deepseek.com',
-    grok: 'https://api.x.ai'
-  };
+  const providerBaseUrls = Utils.DEFAULT_PROVIDER_BASE_URLS;
   
   const baseUrl = baseUrls[provider] || providerBaseUrls[provider] || '';
   
@@ -2971,7 +2893,7 @@ async function getAiClient(): Promise<AiClient> {
   if (!apiKey) {
     throw new Error("未设置 API 密钥。请使用 ai apikey <provider> <密钥> 命令设置，如：ai apikey gemini <密钥>");
   }
-  const baseUrl = baseUrls?.gemini || getConfig(CONFIG_KEYS.AI_BASE_URL) || null;
+  const baseUrl = baseUrls?.gemini || Utils.DEFAULT_PROVIDER_BASE_URLS.gemini;
   return new AiClient(apiKey, baseUrl);
 }
 
@@ -3232,7 +3154,7 @@ async function handleSearch(msg: Api.Message, args: string[]): Promise<void> {
   }
   
   const replyMsg = await msg.getReplyMessage();
-  const { userQuestion, displayQuestion, apiQuestion } = extractQuestionFromArgs(args, replyMsg);
+  const { displayQuestion, apiQuestion } = extractQuestionFromArgs(args, replyMsg);
   
   if (!apiQuestion) {
     await msg.edit({ text: "❌ 请提供搜索查询或回复一条有文字内容的消息" });
@@ -3265,7 +3187,7 @@ async function handleSearch(msg: Api.Message, args: string[]): Promise<void> {
 
 async function handleImage(msg: Api.Message, args: string[]): Promise<void> {
   const replyMsg = await msg.getReplyMessage();
-  const { userQuestion, displayQuestion, apiQuestion } = extractQuestionFromArgs(args, replyMsg);
+  const { displayQuestion, apiQuestion } = extractQuestionFromArgs(args, replyMsg);
   
   if (!apiQuestion) {
     await msg.edit({ text: "❌ 请提供图片生成提示或回复一条有文字内容的消息" });
@@ -3458,8 +3380,8 @@ async function processAudioGenerationForProvider(
   if (replyMsg) {
     let processedAudio: any = combinedAudio;
     
-    if (response.audioMimeType && response.audioMimeType.includes('L16') && response.audioMimeType.includes('pcm')) {
-      processedAudio = Utils.convertToWav(combinedAudio, response.audioMimeType) as any;
+    if (Utils.isPcmL16Audio(response.audioMimeType)) {
+      processedAudio = Utils.convertToWav(combinedAudio, response.audioMimeType!) as any;
     }
 
     const audioFile = Object.assign(processedAudio as any, {
@@ -3765,15 +3687,32 @@ async function handleSettings(msg: Api.Message): Promise<void> {
   const switchToText = (value: string): string => value === "on" ? "开启" : "关闭";
   const tokensToText = (value: string): string => value === "0" ? "无限制" : value;
   
-  const activeProvider = getConfig(CONFIG_KEYS.AI_ACTIVE_PROVIDER, "");
+  // 获取实际的活跃服务商（与getActiveProviderFor逻辑保持一致）
+  let displayProvider = "自动选择";
+  try {
+    const chatProvider = getActiveProviderFor('chat');
+    displayProvider = chatProvider.toUpperCase();
+  } catch {
+    displayProvider = "自动选择";
+  }
   
+  // 安全获取模型信息
+  const getModelSafely = (feature: 'chat' | 'search' | 'image' | 'tts'): string => {
+    try {
+      const model = getActiveModelFor(feature);
+      return model || "";
+    } catch {
+      return "";
+    }
+  };
+
   const settings = {
-    "活跃服务商": activeProvider ? activeProvider.toUpperCase() : "自动选择",
+    "活跃服务商": displayProvider,
     "基础 URL": Utils.censorUrl(getConfig(CONFIG_KEYS.AI_BASE_URL)),
-    "聊天模型": getActiveModelFor('chat'),
-    "搜索模型": getActiveModelFor('search'),
-    "图片模型": getActiveModelFor('image'),
-    "TTS模型": getActiveModelFor('tts'),
+    "聊天模型": getModelSafely('chat'),
+    "搜索模型": getModelSafely('search'),
+    "图片模型": getModelSafely('image'),
+    "TTS模型": getModelSafely('tts'),
     "TTS语音": getConfig(CONFIG_KEYS.AI_TTS_VOICE),
     "最大Token数": tokensToText(getConfig(CONFIG_KEYS.AI_MAX_TOKENS)),
     "上下文启用": switchToText(getConfig(CONFIG_KEYS.AI_CONTEXT_ENABLED)),
@@ -3792,128 +3731,154 @@ async function handleModelList(msg: Api.Message): Promise<void> {
   await msg.edit({ text: "🔍 获取可用模型..." });
   
   try {
+    // 获取当前使用的服务商
+    const currentProvider = ConfigManager.get(CONFIG_KEYS.AI_CURRENT_PROVIDER) || ConfigManager.get(CONFIG_KEYS.AI_ACTIVE_PROVIDER) || '';
+    
+    if (!currentProvider) {
+      await msg.edit({ 
+        text: "❌ 未设置当前服务商\n\n💡 使用 <code>ai select &lt;provider&gt;</code> 选择服务商", 
+        parseMode: "html" 
+      });
+      return;
+    }
+    
     const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, "{}");
     const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, "{}");
-    let modelText = "<b>📋 可用模型列表:</b>\n\n";
     
-    // 官方服务商模型
-    const officialProviders = [
-      { key: 'gemini', name: 'Google Gemini', models: ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro'] },
-      { key: 'openai', name: 'OpenAI', models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'dall-e-3', 'tts-1'] },
-      { key: 'claude', name: 'Anthropic Claude', models: ['claude-3-5-sonnet-20241022', 'claude-3-haiku-20240307', 'claude-3-opus-20240229'] },
-      { key: 'deepseek', name: 'DeepSeek', models: ['deepseek-chat', 'deepseek-coder'] },
-      { key: 'grok', name: 'xAI Grok', models: ['grok-beta'] }
-    ];
+    // 检查当前服务商是否有API密钥
+    if (!checkProviderApiKey(currentProvider as any)) {
+      await msg.edit({ 
+        text: `❌ ${currentProvider.toUpperCase()} 服务商未配置API密钥\n\n💡 使用 <code>ai apikey ${currentProvider} &lt;密钥&gt;</code> 进行配置`, 
+        parseMode: "html" 
+      });
+      return;
+    }
     
-    let hasAnyProvider = false;
+    let modelText = `<b>📋 ${currentProvider.toUpperCase()} 可用模型列表:</b>\n\n`;
     
-    for (const provider of officialProviders) {
-      if (keys[provider.key]) {
-        hasAnyProvider = true;
-        const caps = getProviderCaps()[provider.key as keyof ReturnType<typeof getProviderCaps>];
+    if (currentProvider === 'thirdparty') {
+      // 第三方API模型
+      if (!baseUrls?.thirdparty) {
+        await msg.edit({ 
+          text: "❌ 第三方服务商未配置baseUrl\n\n💡 使用 <code>ai baseurl thirdparty &lt;地址&gt;</code> 进行配置", 
+          parseMode: "html" 
+        });
+        return;
+      }
+      
+      const compat = getThirdPartyCompat();
+      const effectiveCompat = compat || 'openai';
+      
+      try {
+        const allThirdPartyModels = await listModelsThirdPartyOpenAI();
+        
+        // 根据兼容模式显示功能标识
+        const caps = getProviderCaps().thirdparty;
         const features = [];
         if (caps?.chat) features.push('💬聊天');
         if (caps?.search) features.push('🔍搜索');
         if (caps?.image) features.push('🖼️图片');
         if (caps?.tts) features.push('🔊语音');
         
-        modelText += `<b>🔹 ${provider.name}</b> (${features.join(' ')})\n`;
+        const compatName = {
+          gemini: 'Gemini',
+          openai: 'OpenAI',
+          claude: 'Claude',
+          deepseek: 'DeepSeek',
+          grok: 'Grok'
+        }[effectiveCompat] || effectiveCompat;
+        
+        modelText += `<b>🔹 第三方API</b> (兼容 ${compatName}) (${features.join(' ')})\n\n`;
+    
+        // 按服务商分类模型
+        const categorizedModels = {
+          gemini: allThirdPartyModels.filter(m => m.toLowerCase().includes('gemini')),
+          openai: allThirdPartyModels.filter(m => m.toLowerCase().includes('gpt') || m.toLowerCase().includes('davinci') || m.toLowerCase().includes('turbo')),
+          claude: allThirdPartyModels.filter(m => m.toLowerCase().includes('claude')),
+          deepseek: allThirdPartyModels.filter(m => m.toLowerCase().includes('deepseek')),
+          grok: allThirdPartyModels.filter(m => m.toLowerCase().includes('grok')),
+          other: allThirdPartyModels.filter(m => 
+            !m.toLowerCase().includes('gemini') && 
+            !m.toLowerCase().includes('gpt') && 
+            !m.toLowerCase().includes('davinci') && 
+            !m.toLowerCase().includes('turbo') && 
+            !m.toLowerCase().includes('claude') && 
+            !m.toLowerCase().includes('deepseek') && 
+            !m.toLowerCase().includes('grok')
+          )
+        };
+        
+        // 显示分类后的模型，限制每类最多显示10个
+        let totalShown = 0;
+        const maxPerCategory = 10;
+        const maxTotal = 50;
+        
+        for (const [category, models] of Object.entries(categorizedModels)) {
+          if (models.length > 0 && totalShown < maxTotal) {
+            const categoryName = {
+              gemini: 'Gemini系列',
+              openai: 'OpenAI系列', 
+              claude: 'Claude系列',
+              deepseek: 'DeepSeek系列',
+              grok: 'Grok系列',
+              other: '其他模型'
+            }[category] || category;
+            
+            const modelsToShow = models.slice(0, Math.min(maxPerCategory, maxTotal - totalShown));
+            modelText += `<b>${categoryName}</b> (${models.length}个):\n`;
+            modelText += modelsToShow.map(model => `  • <code>${model}</code>`).join('\n') + '\n\n';
+            
+            if (models.length > modelsToShow.length) {
+              modelText += `  ... 还有${models.length - modelsToShow.length}个模型\n\n`;
+            }
+            totalShown += modelsToShow.length;
+          }
+        }
+        
+        if (allThirdPartyModels.length > totalShown) {
+          modelText += `💡 共${allThirdPartyModels.length}个模型，仅显示前${totalShown}个\n\n`;
+        }
+        
+      } catch (error) {
+        modelText += `❌ 获取模型失败: ${error}\n\n`;
+      }
+    } else {
+      // 官方服务商模型
+      const officialProviders = {
+        gemini: { name: 'Google Gemini', models: ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro'] },
+        openai: { name: 'OpenAI', models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'dall-e-3', 'tts-1'] },
+        claude: { name: 'Anthropic Claude', models: ['claude-3-5-sonnet-20241022', 'claude-3-haiku-20240307', 'claude-3-opus-20240229'] },
+        deepseek: { name: 'DeepSeek', models: ['deepseek-chat', 'deepseek-coder'] },
+        grok: { name: 'xAI Grok', models: ['grok-beta'] }
+      };
+      
+      const provider = officialProviders[currentProvider as keyof typeof officialProviders];
+      if (provider) {
+        const caps = getProviderCaps()[currentProvider as keyof ReturnType<typeof getProviderCaps>];
+        const features = [];
+        if (caps?.chat) features.push('💬聊天');
+        if (caps?.search) features.push('🔍搜索');
+        if (caps?.image) features.push('🖼️图片');
+        if (caps?.tts) features.push('🔊语音');
+        
+        modelText += `<b>🔹 ${provider.name}</b> (${features.join(' ')})\n\n`;
         modelText += provider.models.map(model => `  • <code>${model}</code>`).join('\n') + '\n\n';
       }
     }
     
-    // 第三方API模型
-    const compat = getThirdPartyCompat();
-    // 如果没有设置兼容模式，默认使用 openai 兼容
-    const effectiveCompat = compat || 'openai';
-    if (baseUrls?.thirdparty && (keys?.thirdparty || getConfig(CONFIG_KEYS.AI_API_KEY))) {
-      const supportedCompats = ['gemini', 'openai', 'claude', 'deepseek', 'grok'];
-      if (supportedCompats.includes(effectiveCompat)) {
-        hasAnyProvider = true;
-        try {
-          const allThirdPartyModels = await listModelsThirdPartyOpenAI();
-          
-          // 按服务商分类模型
-          const categorizedModels = {
-            gemini: allThirdPartyModels.filter(m => m.toLowerCase().includes('gemini')),
-            openai: allThirdPartyModels.filter(m => m.toLowerCase().includes('gpt') || m.toLowerCase().includes('davinci') || m.toLowerCase().includes('turbo')),
-            claude: allThirdPartyModels.filter(m => m.toLowerCase().includes('claude')),
-            deepseek: allThirdPartyModels.filter(m => m.toLowerCase().includes('deepseek')),
-            grok: allThirdPartyModels.filter(m => m.toLowerCase().includes('grok')),
-            other: allThirdPartyModels.filter(m => 
-              !m.toLowerCase().includes('gemini') && 
-              !m.toLowerCase().includes('gpt') && 
-              !m.toLowerCase().includes('davinci') && 
-              !m.toLowerCase().includes('turbo') && 
-              !m.toLowerCase().includes('claude') && 
-              !m.toLowerCase().includes('deepseek') && 
-              !m.toLowerCase().includes('grok')
-            )
-          };
-          
-          // 根据兼容模式显示功能标识
-          const caps = getProviderCaps().thirdparty;
-          const features = [];
-          if (caps?.chat) features.push('💬聊天');
-          if (caps?.search) features.push('🔍搜索');
-          if (caps?.image) features.push('🖼️图片');
-          if (caps?.tts) features.push('🔊语音');
-          
-          const compatName = {
-            gemini: 'Gemini',
-            openai: 'OpenAI',
-            claude: 'Claude',
-            deepseek: 'DeepSeek',
-            grok: 'Grok'
-          }[effectiveCompat] || effectiveCompat;
-          
-          modelText += `<b>🔹 第三方API</b> (兼容 ${compatName}) (${features.join(' ')})\n`;
-          
-          // 显示分类后的模型，限制每类最多显示5个
-          let totalShown = 0;
-          const maxPerCategory = 5;
-          const maxTotal = 20;
-          
-          for (const [category, models] of Object.entries(categorizedModels)) {
-            if (models.length > 0 && totalShown < maxTotal) {
-              const categoryName = {
-                gemini: 'Gemini系列',
-                openai: 'OpenAI系列', 
-                claude: 'Claude系列',
-                deepseek: 'DeepSeek系列',
-                grok: 'Grok系列',
-                other: '其他模型'
-              }[category] || category;
-              
-              const modelsToShow = models.slice(0, Math.min(maxPerCategory, maxTotal - totalShown));
-              modelText += `  <b>${categoryName}</b> (${models.length}个):\n`;
-              modelText += modelsToShow.map(model => `    • <code>${model}</code>`).join('\n') + '\n';
-              
-              if (models.length > modelsToShow.length) {
-                modelText += `    ... 还有${models.length - modelsToShow.length}个模型\n`;
-              }
-              modelText += '\n';
-              totalShown += modelsToShow.length;
-            }
-          }
-          
-          if (allThirdPartyModels.length > totalShown) {
-            modelText += `  💡 共${allThirdPartyModels.length}个模型，仅显示前${totalShown}个\n\n`;
-          }
-          
-        } catch (error) {
-          modelText += `<b>🔹 第三方API</b> (兼容 OpenAI) (💬聊天)\n`;
-          modelText += `  ❌ 获取模型失败: ${error}\n\n`;
-        }
+    // 显示当前模型配置
+    const currentModels = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_MODELS, '{}');
+    if (Object.keys(currentModels).length > 0) {
+      modelText += "<b>📌 当前模型配置:</b>\n";
+      const featureNames = { chat: '💬聊天', search: '🔍搜索', image: '🖼️图片', tts: '🔊语音' };
+      for (const [feature, model] of Object.entries(currentModels)) {
+        const featureName = featureNames[feature as keyof typeof featureNames] || feature;
+        modelText += `  ${featureName}: <code>${model}</code>\n`;
       }
+      modelText += "\n";
     }
     
-    if (!hasAnyProvider) {
-      modelText += "❌ 未配置任何服务商API密钥\n\n";
-      modelText += "💡 使用 <code>ai apikey &lt;provider&gt; &lt;key&gt;</code> 设置密钥";
-    } else {
-      modelText += "💡 使用 <code>ai model set &lt;type&gt; &lt;model&gt;</code> 设置模型";
-    }
+    modelText += "💡 使用 <code>ai model set &lt;type&gt; &lt;model&gt;</code> 设置模型";
     
     await msg.edit({ text: modelText, parseMode: "html" });
   } catch (error: any) {
@@ -4236,18 +4201,39 @@ async function handleTTSVoice(msg: Api.Message, args: string[]): Promise<void> {
   }
   
   if (args[0].toLowerCase() === 'list') {
-    const availableVoices = [
-      "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Aoede", "Autonoe", "Callirrhoe",
-      "Charon", "Despina", "Enceladus", "Erinome", "Fenrir", "Gacrux", "Iapetus", "Kore",
-      "Laomedeia", "Leda", "Orus", "Puck", "Pulcherrima", "Rasalgethi", "Sadachbia",
-      "Sadaltager", "Schedar", "Sulafat", "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi"
-    ];
+    // 获取当前TTS服务商
+    const currentTTSProvider = getActiveProviderFor('tts');
+    
+    // 根据服务商获取对应的语音列表
+    let availableVoices: string[] = [];
+    let providerName = '';
+    
+    if (currentTTSProvider === 'gemini') {
+      availableVoices = [
+        "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Aoede", "Autonoe", "Callirrhoe",
+        "Charon", "Despina", "Enceladus", "Erinome", "Fenrir", "Gacrux", "Iapetus", "Kore",
+        "Laomedeia", "Leda", "Orus", "Puck", "Pulcherrima", "Rasalgethi", "Sadachbia",
+        "Sadaltager", "Schedar", "Sulafat", "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi"
+      ];
+      providerName = 'Gemini';
+    } else {
+      // OpenAI兼容的服务商 (openai, claude, deepseek, grok, thirdparty)
+      availableVoices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+      const providerNames = {
+        'openai': 'OpenAI',
+        'claude': 'Claude (OpenAI兼容)',
+        'deepseek': 'DeepSeek (OpenAI兼容)',
+        'grok': 'Grok (OpenAI兼容)',
+        'thirdparty': '第三方API (OpenAI兼容)'
+      };
+      providerName = providerNames[currentTTSProvider] || 'OpenAI兼容';
+    }
     
     const currentVoice = getConfig(CONFIG_KEYS.AI_TTS_VOICE);
-    let voiceList = "🎵 <b>可用的 TTS 音色列表:</b>\n\n";
+    let voiceList = `🎵 <b>${providerName} TTS 音色列表:</b>\n\n`;
     
     availableVoices.forEach(voice => {
-      if (voice === currentVoice) {
+      if (voice.toLowerCase() === currentVoice?.toLowerCase()) {
         voiceList += `• <b>${voice}</b> ✅ (当前使用)\n`;
       } else {
         voiceList += `• ${voice}\n`;
@@ -4255,6 +4241,7 @@ async function handleTTSVoice(msg: Api.Message, args: string[]): Promise<void> {
     });
     
     voiceList += "\n💡 使用 <code>ai ttsvoice &lt;音色名称&gt;</code> 来设置音色";
+    voiceList += `\n🔄 当前TTS服务商: <b>${providerName}</b>`;
     
     await msg.edit({ text: voiceList, parseMode: "html" });
     return;
@@ -4262,23 +4249,50 @@ async function handleTTSVoice(msg: Api.Message, args: string[]): Promise<void> {
   
   const voiceName = args.join(" ");
   
-  const availableVoices = [
-    "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Aoede", "Autonoe", "Callirrhoe",
-    "Charon", "Despina", "Enceladus", "Erinome", "Fenrir", "Gacrux", "Iapetus", "Kore",
-    "Laomedeia", "Leda", "Orus", "Puck", "Pulcherrima", "Rasalgethi", "Sadachbia",
-    "Sadaltager", "Schedar", "Sulafat", "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi"
-  ];
+  // 获取当前TTS服务商
+  const currentTTSProvider = getActiveProviderFor('tts');
   
-  if (!availableVoices.includes(voiceName)) {
+  // 根据服务商获取对应的语音列表
+  let availableVoices: string[] = [];
+  
+  if (currentTTSProvider === 'gemini') {
+    availableVoices = [
+      "Achernar", "Achird", "Algenib", "Algieba", "Alnilam", "Aoede", "Autonoe", "Callirrhoe",
+      "Charon", "Despina", "Enceladus", "Erinome", "Fenrir", "Gacrux", "Iapetus", "Kore",
+      "Laomedeia", "Leda", "Orus", "Puck", "Pulcherrima", "Rasalgethi", "Sadachbia",
+      "Sadaltager", "Schedar", "Sulafat", "Umbriel", "Vindemiatrix", "Zephyr", "Zubenelgenubi"
+    ];
+  } else {
+    // OpenAI兼容的服务商
+    availableVoices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+  }
+  
+  // 检查语音名称是否有效（不区分大小写）
+  const isValidVoice = availableVoices.some(voice => voice.toLowerCase() === voiceName.toLowerCase());
+  
+  if (!isValidVoice) {
+    const providerNames = {
+      'gemini': 'Gemini',
+      'openai': 'OpenAI',
+      'claude': 'Claude (OpenAI兼容)',
+      'deepseek': 'DeepSeek (OpenAI兼容)',
+      'grok': 'Grok (OpenAI兼容)',
+      'thirdparty': '第三方API (OpenAI兼容)'
+    };
+    const providerName = providerNames[currentTTSProvider] || 'OpenAI兼容';
+    
     await msg.edit({ 
-      text: `❌ 无效的音色名称: <code>${voiceName}</code>\n\n💡 使用 <code>ai ttsvoice list</code> 查看所有可用音色`, 
+      text: `❌ 无效的音色名称: <code>${voiceName}</code>\n\n💡 使用 <code>ai ttsvoice list</code> 查看 ${providerName} 支持的音色`, 
       parseMode: "html" 
     });
     return;
   }
   
-  ConfigManager.set(CONFIG_KEYS.AI_TTS_VOICE, voiceName);
-  await msg.edit({ text: `✅ TTS 语音已设置为: <code>${voiceName}</code>`, parseMode: "html" });
+  // 使用正确的大小写格式
+  const correctVoiceName = availableVoices.find(voice => voice.toLowerCase() === voiceName.toLowerCase()) || voiceName;
+  
+  ConfigManager.set(CONFIG_KEYS.AI_TTS_VOICE, correctVoiceName);
+  await msg.edit({ text: `✅ TTS 语音已设置为: <code>${correctVoiceName}</code>`, parseMode: "html" });
 }
 
 async function handleConfigDefault(msg: Api.Message): Promise<void> {
@@ -4301,6 +4315,10 @@ async function handleConfigDefault(msg: Api.Message): Promise<void> {
     
     // 清除提示词
     ConfigManager.set(CONFIG_KEYS.AI_PROMPTS, "{}");
+    
+    // 强制刷新缓存，确保配置清空生效
+    ConfigManager.flushCache();
+    ConfigManager.flush();
     
     await msg.edit({ 
       text: "✅ 配置已重置到默认状态\n\n" +
@@ -4385,90 +4403,83 @@ async function handleSelectCommand(msg: Api.Message, subArgs: string[]): Promise
     return;
   }
   
-  // 检查服务商是否有API密钥
-  if (!checkProviderApiKey(provider as any)) {
-    await msg.edit({ text: `❌ ${provider.toUpperCase()} 服务商未配置API密钥，请先使用 ai apikey ${provider} <密钥> 进行配置` });
+  // 检查是否需要使用第三方API来访问官方服务商
+  const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, '{}');
+  const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, '{}');
+  
+  let actualProvider = provider;
+  let useThirdPartyForOfficial = false;
+  
+  // 如果用户选择了官方服务商，但没有对应的API密钥，而有第三方配置，则使用第三方模式
+  if (provider !== 'thirdparty' && !keys[provider] && keys.thirdparty && baseUrls.thirdparty) {
+    actualProvider = 'thirdparty';
+    useThirdPartyForOfficial = true;
+  }
+  
+  // 检查实际使用的服务商是否有API密钥
+  if (!checkProviderApiKey(actualProvider as any)) {
+    if (useThirdPartyForOfficial) {
+      await msg.edit({ text: `❌ 第三方服务商未配置API密钥，无法访问${provider.toUpperCase()}，请先使用 ai apikey thirdparty <密钥> 进行配置` });
+    } else {
+      await msg.edit({ text: `❌ ${provider.toUpperCase()} 服务商未配置API密钥，请先使用 ai apikey ${provider} <密钥> 进行配置` });
+    }
     return;
   }
   
-  // 设置活跃服务商
-  ConfigManager.set(CONFIG_KEYS.AI_ACTIVE_PROVIDER, provider);
-  
-  // 设置所有功能都使用选定的服务商
-  const models = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_MODELS, '{}');
-  const features = ['chat', 'search', 'image', 'tts'] as const;
-  const updatedFeatures: string[] = [];
-  
-  for (const feature of features) {
-    if (isFeatureSupported(provider as any, feature)) {
-      // 获取该服务商支持的默认模型
-      const defaultModel = getDefaultModelForProvider(provider as any, feature);
-      if (defaultModel) {
-        models[feature] = defaultModel;
-        updatedFeatures.push(feature);
-      }
+  // 如果是第三方服务商，还需要检查baseUrl
+  if (actualProvider === 'thirdparty') {
+    if (!baseUrls.thirdparty) {
+      await msg.edit({ text: `❌ 第三方服务商未配置baseUrl，请先使用 ai baseurl thirdparty <地址> 进行配置` });
+      return;
     }
   }
   
-  if (updatedFeatures.length === 0) {
+  // 设置服务商配置
+  if (useThirdPartyForOfficial) {
+    // 使用第三方API访问官方服务商
+    ConfigManager.set(CONFIG_KEYS.AI_CURRENT_PROVIDER, 'thirdparty');
+    ConfigManager.set(CONFIG_KEYS.AI_ACTIVE_PROVIDER, 'thirdparty');
+    ConfigManager.set(CONFIG_KEYS.AI_THIRD_PARTY_COMPAT, provider);
+    provider = 'thirdparty'; // 更新provider变量以便后续逻辑正确处理
+  } else {
+    // 正常设置服务商
+    ConfigManager.set(CONFIG_KEYS.AI_CURRENT_PROVIDER, provider);
+    ConfigManager.set(CONFIG_KEYS.AI_ACTIVE_PROVIDER, provider);
+  }
+  
+  // 执行自动模型匹配和配置更新
+  const autoAssignResult = await performCurrentProviderAutoModelAssignment(true);
+  
+  // 获取支持的功能列表
+  const { supported, unsupported } = getCurrentProviderSupportedFeatures();
+  
+  if (supported.length === 0) {
     await msg.edit({ text: `❌ ${provider.toUpperCase()} 服务商不支持任何功能` });
     return;
   }
   
-  ConfigManager.set(CONFIG_KEYS.AI_MODELS, JSON.stringify(models));
-  
   const featureNames = { chat: '💬聊天', search: '🔍搜索', image: '🖼️图片', tts: '🔊语音' };
-  const supportedFeaturesList = updatedFeatures.map(f => featureNames[f as keyof typeof featureNames]).join(' ');
+  const supportedFeaturesList = supported.map(f => featureNames[f as keyof typeof featureNames]).join(' ');
+  
+  let responseText = `✅ 已切换到 ${provider.toUpperCase()} 服务商\n\n支持功能: ${supportedFeaturesList}`;
+  
+  if (unsupported.length > 0) {
+    const unsupportedFeaturesList = unsupported.map(f => featureNames[f as keyof typeof featureNames]).join(' ');
+    responseText += `\n不支持功能: ${unsupportedFeaturesList}`;
+  }
+  
+  responseText += `\n\n${autoAssignResult}`;
+  
+  // 强制立即写入配置，确保切换时数据立即持久化
+  ConfigManager.flush();
   
   await msg.edit({ 
-    text: `✅ 已选择 ${provider.toUpperCase()} 作为AI服务商\n\n支持功能: ${supportedFeaturesList}`,
+    text: responseText,
     parseMode: 'markdown'
   });
 }
 
-// 获取服务商的默认模型
-function getDefaultModelForProvider(provider: 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok' | 'thirdparty', feature: 'chat' | 'search' | 'image' | 'tts'): string | null {
-  const providerDefaults = {
-    gemini: {
-      chat: 'gemini-1.5-flash',
-      search: 'gemini-1.5-flash',
-      image: 'gemini-1.5-flash',
-      tts: 'tts-1'
-    },
-    openai: {
-      chat: 'gpt-4o-mini',
-      search: 'gpt-4o-mini',
-      image: 'dall-e-3',
-      tts: 'tts-1'
-    },
-    claude: {
-      chat: 'claude-3-5-haiku-20241022',
-      search: 'claude-3-5-haiku-20241022',
-      image: null,
-      tts: null
-    },
-    deepseek: {
-      chat: 'deepseek-chat',
-      search: 'deepseek-chat',
-      image: null,
-      tts: null
-    },
-    grok: {
-      chat: 'grok-beta',
-      search: 'grok-beta',
-      image: null,
-      tts: null
-    },
-    thirdparty: {
-      chat: 'gpt-4o-mini',
-      search: 'gpt-4o-mini',
-      image: 'dall-e-3',
-      tts: 'tts-1'
-    }
-  };
-  
-  return providerDefaults[provider]?.[feature] || null;
-}
+
 
 // 处理API密钥设置命令
 async function handleApiKeyCommand(msg: Api.Message, subArgs: string[]): Promise<void> {
@@ -4480,23 +4491,43 @@ async function handleApiKeyCommand(msg: Api.Message, subArgs: string[]): Promise
       await msg.edit({ text: "❌ 用法: ai apikey <gemini|thirdparty|openai|claude|deepseek|grok> <密钥>" });
       return;
     }
+    
+    // 获取当前使用的服务商
+    const currentProvider = getConfig(CONFIG_KEYS.AI_CURRENT_PROVIDER);
+    const isFirstSetup = !currentProvider;
+    
     const keys = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_KEYS, '{}');
     keys[provider] = keyVal;
     ConfigManager.set(CONFIG_KEYS.AI_KEYS, JSON.stringify(keys));
     if (provider === 'gemini') ConfigManager.set(CONFIG_KEYS.AI_API_KEY, keyVal);
-    // 自动更新TTS语音以匹配新的provider
-    autoUpdateTTSVoice();
-    const displayValue = keyVal.substring(0, 8) + '...';
     
+    // 如果是首次设置或者修改的是当前服务商，设置为当前服务商
+    if (isFirstSetup || provider === currentProvider) {
+      ConfigManager.set(CONFIG_KEYS.AI_CURRENT_PROVIDER, provider);
+      ConfigManager.set(CONFIG_KEYS.AI_ACTIVE_PROVIDER, provider);
+    }
+    
+    const displayValue = keyVal.substring(0, 8) + '...';
     let responseText = `✅ 已设置 ${provider} API Key: \`${displayValue}\``;
     
-    // 如果是第三方API密钥，添加baseurl设置提示
-    if (provider === 'thirdparty') {
-      responseText += '\n\n💡 请继续设置第三方的baseurl：\n`ai baseurl thirdparty <地址>`';
+    // 只有当修改的是当前服务商或首次设置时，才进行模型匹配和配置更新
+    if (isFirstSetup || provider === currentProvider) {
+      // 自动更新TTS语音以匹配新的provider
+      autoUpdateTTSVoice();
+      
+      if (provider === 'thirdparty') {
+        responseText += '\n\n💡 请继续设置第三方的baseurl：\n`ai baseurl thirdparty <地址>`';
+      } else {
+        // 官方API自动配置模型
+        const autoConfigResult = await performOfficialAutoModelAssignment(provider as 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok');
+        responseText += `\n\n${autoConfigResult}`;
+      }
+      
+      if (isFirstSetup) {
+        responseText += `\n\n🎯 已设置 ${provider} 为当前使用服务商`;
+      }
     } else {
-      // 官方API自动配置模型
-      const autoConfigResult = await performOfficialAutoModelAssignment(provider as 'gemini' | 'openai' | 'claude' | 'deepseek' | 'grok');
-      responseText += `\n\n${autoConfigResult}`;
+      responseText += `\n\n💾 已保存配置，当前使用服务商仍为: ${currentProvider}`;
     }
     
     await msg.edit({ text: responseText, parseMode: 'markdown' });
@@ -4509,22 +4540,52 @@ async function handleApiKeyCommand(msg: Api.Message, subArgs: string[]): Promise
 
 // 处理基础URL设置命令
 async function handleBaseUrlCommand(msg: Api.Message, subArgs: string[]): Promise<void> {
-  if (subArgs.length >= 2 && subArgs[0].toLowerCase() === 'thirdparty') {
+  const supportedProviders = ["thirdparty", "openai", "claude", "deepseek", "grok"];
+  
+  if (subArgs.length >= 2) {
+    const provider = subArgs[0].toLowerCase();
     const url = subArgs[1].trim();
-    const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, '{}');
-    baseUrls.thirdparty = url;
-    ConfigManager.set(CONFIG_KEYS.AI_BASE_URLS, JSON.stringify(baseUrls));
-    // 自动更新TTS语音以匹配新的provider
-    autoUpdateTTSVoice();
     
-    // 执行自动模型匹配
-    const autoAssignResult = await performAutoModelAssignment(url);
+    if (!supportedProviders.includes(provider)) {
+      await msg.edit({ text: "❌ 用法: ai baseurl <thirdparty|openai|claude|deepseek|grok> <url>" });
+      return;
+    }
+    
+    // 获取当前使用的服务商
+    const currentProvider = getConfig(CONFIG_KEYS.AI_CURRENT_PROVIDER);
+    
+    const baseUrls = getJsonConfig<Record<string, string>>(CONFIG_KEYS.AI_BASE_URLS, '{}');
+    baseUrls[provider] = url;
+    ConfigManager.set(CONFIG_KEYS.AI_BASE_URLS, JSON.stringify(baseUrls));
+    
+    let responseText = `✅ 已设置 ${provider} 基础 URL: \`${Utils.censorUrl(url)}\``;
+    
+    // 只有当修改的是当前服务商时，才进行模型匹配和配置更新
+    if (provider === currentProvider) {
+      // 确保活跃服务商也同步更新
+      ConfigManager.set(CONFIG_KEYS.AI_ACTIVE_PROVIDER, provider);
+      // 自动更新TTS语音以匹配新的provider
+      autoUpdateTTSVoice();
+      
+      if (provider === 'thirdparty') {
+        // 执行自动模型匹配
+        const autoAssignResult = await performAutoModelAssignment(url);
+        responseText += `\n\n${autoAssignResult}`;
+      } else {
+        // 官方服务商重新配置模型
+        const autoConfigResult = await performOfficialAutoModelAssignment(provider as 'openai' | 'claude' | 'deepseek' | 'grok');
+        responseText += `\n\n${autoConfigResult}`;
+      }
+    } else {
+      responseText += `\n\n💾 已保存配置，当前使用服务商仍为: ${currentProvider || '未设置'}`;
+    }
+    
     await msg.edit({ 
-      text: `✅ 已设置第三方基础 URL: \`${Utils.censorUrl(url)}\`\n\n${autoAssignResult}`, 
+      text: responseText, 
       parseMode: 'markdown' 
     });
   } else {
-    await msg.edit({ text: "❌ 用法: ai baseurl thirdparty <url>" });
+    await msg.edit({ text: "❌ 用法: ai baseurl <thirdparty|openai|claude|deepseek|grok> <url>" });
   }
 }
 
@@ -4537,8 +4598,23 @@ async function handleThirdPartyCommand(msg: Api.Message, subArgs: string[]): Pro
       await msg.edit({ text: "❌ 用法: ai thirdparty compat <gemini|openai|claude|deepseek|grok>" });
       return;
     }
+    
+    // 获取当前使用的服务商
+    const currentProvider = ConfigManager.get(CONFIG_KEYS.AI_CURRENT_PROVIDER) || ConfigManager.get(CONFIG_KEYS.AI_ACTIVE_PROVIDER) || '';
+    
     ConfigManager.set(CONFIG_KEYS.AI_THIRD_PARTY_COMPAT, type);
-    await msg.edit({ text: `✅ 第三方兼容模式已设置为: <code>${type}</code>`, parseMode: 'html' });
+    
+    let responseText = `✅ 第三方兼容模式已设置为: <code>${type}</code>`;
+    
+    // 只有当前正在使用第三方服务商时，才触发模型重新匹配
+    if (currentProvider === 'thirdparty') {
+      const autoAssignResult = await performCurrentProviderAutoModelAssignment(true);
+      responseText += `\n\n${autoAssignResult}`;
+    } else {
+      responseText += '\n\n💡 当前未使用第三方服务商，兼容模式设置已保存，切换到第三方服务商时将生效';
+    }
+    
+    await msg.edit({ text: responseText, parseMode: 'html' });
   } else {
     await msg.edit({ text: "❌ 用法: ai thirdparty compat <gemini|openai|claude|deepseek|grok>" });
   }
@@ -4863,8 +4939,10 @@ async function handleAIRequest(msg: Api.Message): Promise<void> {
  * AI多服务商通用插件类
  */
 class AiPlugin extends Plugin {
-  description: string = `🤖 AI 多服务商通用插件
-支持 Google Gemini、OpenAI、Anthropic Claude、DeepSeek、xAI Grok 等多个AI服务商，提供统一的AI服务接口和灵活的服务商选择功能。
+  description: string = `🤖 AI 多服务商智能管理插件
+支持 Google Gemini、OpenAI、Anthropic Claude、DeepSeek、xAI Grok 等多个AI服务商，提供统一的AI服务接口和智能化的服务商管理功能。
+
+🌟 <b>新特性</b>：智能服务商切换 + 自动模型匹配 + 统一配置管理
 
 ━━━ 核心功能 ━━━
 • <code>ai [query]</code> - 与AI模型聊天对话（默认功能，支持图片识别）
@@ -4874,21 +4952,21 @@ class AiPlugin extends Plugin {
 • <code>ai audio [query]</code> - 聊天对话并转换为语音回答
 • <code>ai searchaudio [query]</code> - 搜索并转换为语音回答
 
-━━━ 服务商管理 ━━━
+━━━ 智能服务商管理 ━━━
 • <code>ai apikey &lt;provider&gt; &lt;密钥&gt;</code> - 设置服务商API密钥
   支持的服务商: gemini, openai, claude, deepseek, grok, thirdparty
-• <code>ai select &lt;provider&gt;</code> - 选择使用的AI服务商
+• <code>ai select &lt;provider&gt;</code> - 🔥 智能切换AI服务商（自动匹配最佳模型配置）
   支持: gemini, openai, claude, deepseek, grok, thirdparty
 • <code>ai baseurl thirdparty &lt;地址&gt;</code> - 设置第三方API基础URL
-• <code>ai thirdparty compat &lt;type&gt;</code> - 设置第三方API兼容模式
+• <code>ai thirdparty compat &lt;type&gt;</code> - 🔥 设置第三方API兼容模式（自动触发模型重匹配）
   支持: openai, gemini, claude, deepseek, grok
 • <code>ai status</code> - 检测所有服务商状态和当前活跃配置
 • <code>ai settings</code> - 显示完整配置信息
 
-━━━ 模型管理 ━━━
-• <code>ai model list</code> - 显示当前模型配置和可用模型
+━━━ 智能模型管理 ━━━
+• <code>ai model list</code> - 🔥 显示当前服务商的可用模型和配置状态
 • <code>ai model set [chat|search|image|tts] &lt;名称&gt;</code> - 手动设置各类型模型
-• <code>ai model auto</code> - 自动匹配第三方API可用模型
+• <code>ai model auto</code> - 🔥 自动匹配当前服务商的最佳模型配置
 • <code>ai chatmodel &lt;模型名&gt;</code> - 设置聊天模型（快捷方式）
 • <code>ai searchmodel &lt;模型名&gt;</code> - 设置搜索模型（快捷方式）
 • <code>ai imagemodel &lt;模型名&gt;</code> - 设置图片生成模型（快捷方式）
@@ -4926,20 +5004,24 @@ class AiPlugin extends Plugin {
 • <code>ai collapse on|off</code> - 开启或关闭折叠引用显示
 • <code>ai config default</code> - 重置所有配置到默认状态
 
-━━━ 高级功能 ━━━
-• 多服务商支持：灵活切换不同AI服务商，满足不同需求
-• 自动模型分配：根据API响应自动匹配最佳模型配置
+━━━ 🚀 智能化高级功能 ━━━
+• 🔥 智能服务商切换：一键切换服务商，自动匹配最佳模型配置
+• 🔥 自动模型分配：根据服务商能力自动选择最优模型组合
+• 🔥 统一配置管理：所有服务商使用统一的配置键，简化管理
 • 多格式支持：支持文本、图片、音频等多种输入输出格式
 • 安全防护：自动过滤敏感信息，保护API密钥安全
 • 配置持久化：所有设置自动保存，重启后完整恢复
+• 功能检测：自动检测服务商支持的功能，避免无效调用
 
-━━━ 使用说明 ━━━
-1. 首次使用需设置至少一个服务商的API密钥
-2. 使用 ai select 命令选择要使用的服务商
-3. 支持回复消息进行对话，自动识别图片内容
-4. 支持自动模型匹配，简化第三方API配置
-5. 所有配置持久化保存，重启后自动恢复
-6. 支持多种兼容模式，轻松接入各类第三方API服务`;
+━━━ 🎯 快速上手指南 ━━━
+1. 🔑 设置API密钥：<code>ai apikey &lt;服务商&gt; &lt;密钥&gt;</code>
+2. 🔄 选择服务商：<code>ai select &lt;服务商&gt;</code>（自动匹配最佳模型）
+3. 💬 开始对话：直接使用 <code>ai</code> 命令，支持回复消息和图片识别
+4. 🔧 第三方API：设置baseurl和兼容模式，系统自动处理模型匹配
+5. 📊 查看状态：使用 <code>ai status</code> 检查所有配置
+6. 🎛️ 高级配置：所有设置持久化保存，支持多种自定义选项
+
+💡 <b>提示</b>：新版本大幅简化了配置流程，服务商切换时会自动处理模型匹配，无需手动配置！`;
 
   cmdHandlers: Record<string, (msg: Api.Message) => Promise<void>> = {
     ai: handleAIRequest,
